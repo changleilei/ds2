@@ -1,3 +1,8 @@
+# coding=utf8
+"""================================
+@Author: Mr.Chang
+@Date  : 2022/10/24 11:05 上午
+==================================="""
 import itertools
 import json
 import time
@@ -10,24 +15,16 @@ import rouge
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from transformers import AdamW
 
-from ds2.utils.state_sum_converter import get_converter
-from ds2.utils.evaluate import get_acc
-from ds2.utils.evaluate import get_template_acc
-from ds2.utils.evaluate import EXPERIMENT_DOMAINS
 
-
-class DS2(pl.LightningModule):
+class DuLeMonModel(pl.LightningModule):
     def __init__(self, args, tokenizer, sum_model, qa_model):
         super().__init__()
         self.args = args
         self.tokenizer = tokenizer
         self.sum_model = sum_model
-        if self.args["use_qa_deconverter"]:
-            self.qa_model = qa_model
         self.lr = args["lr"]
         self.blank = "____"
 
-        self.converter = get_converter(args['state_converter'])
         self.evaluator = rouge.Rouge(
             metrics=['rouge-n'],
             max_n=4,
@@ -61,9 +58,10 @@ class DS2(pl.LightningModule):
             labels=batch["decoder_output"],
         )
 
-        return outputs.loss.item()
+        return {"loss": outputs.loss.item(), "raw_text": batch['input_text']}
 
     def pred_step(self, batch, batch_idx):
+        # 带上预测结果 rouge相关
         self.sum_model.eval()
         pred_summary_token = self.sum_model.generate(
             batch["encoder_input"],
@@ -74,10 +72,9 @@ class DS2(pl.LightningModule):
         )
 
         return {
+            "raw_text": batch['input_text'],
             "pred_summary_token": pred_summary_token,
-            # "gold_state": batch["slot_values"],
-            "gold_summary": batch["output_text"],
-            # "eval_slots": batch["eval_slots"],
+            "gold_summary": batch["output_text"]
         }
 
     def eval_epoch_end(self, outputs):
@@ -93,20 +90,9 @@ class DS2(pl.LightningModule):
             self.tokenizer.decode(_sum, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             for _sum in outputs["pred_summary_token"]
         ]
+        res = {}
 
-        if self.args["use_qa_deconverter"]:
-            pred_state = self.qa_model.sum_to_state(pred_summary, outputs["eval_slots"])
-        else:
-            pred_state = [self.converter.sum_to_state(_sum) for _sum in pred_summary]
-
-        res = get_acc(pred_state, outputs["gold_state"], outputs["eval_slots"])
-
-        gold_templates = [
-            self.converter.state_to_sum(_ds, is_for_template=True, blank=self.blank)
-            for _ds in outputs["gold_state"]
-        ]
-        template_acc = get_template_acc(pred_summary, gold_templates, self.blank)
-        rouge_score = self.evaluator.get_scores(pred_summary, outputs["gold_summary"])["rouge-4"]["f"]
+        rouge_score = self.evaluator.get_scores(pred_summary, outputs["gold_summary"])["rouge-1"]["f"]
         bleu_score = [
             sentence_bleu(
                 [ref.split()],
@@ -118,19 +104,19 @@ class DS2(pl.LightningModule):
         res.update({
             'rouge': rouge_score,
             'bleu': np.mean(bleu_score),
-            'template_acc': template_acc,
         })
+        if 'raw_text' in outputs:
+            samples = {"input_text": outputs['raw_text'], "gold_summary": outputs["gold_summary"], "pred_summary": pred_summary}
+        else:
+            samples = {"gold_summary": outputs["gold_summary"], "pred_summary": pred_summary}
 
-        samples = {"gold_summary": outputs["gold_summary"], "gold_state": outputs["gold_state"], "pred_summary": pred_summary, "pred_state": pred_state}
-        self.save_samples(samples, f'{str(res["jga"])}_{mode}')
-
-        print(res)
+        self.save_samples(samples, f'{str(round(res["bleu"], 4))}_{mode}')
 
         return res
 
     def validation_step(self, batch, batch_idx):
         if self.args["eval_loss_only"]:
-            return self.eval_step(batch, batch_idx)
+            return self.eval_step(batch, batch_idx)['loss']
         else:
             return self.pred_step(batch, batch_idx)
 
@@ -143,20 +129,23 @@ class DS2(pl.LightningModule):
         return res
 
     def test_step(self, batch, batch_idx):
+        # 测试的一小步
         return self.pred_step(batch, batch_idx)
 
-    # def test_epoch_end(self, outputs):
-    #     res = {f'test_{k}': v for k, v in self.pred_epoch_end(outputs, "test").items()}
-    #     self.log_dict(res)
-    #     return res
+    def test_epoch_end(self, outputs):
+        res = {f'test_{k}': v for k, v in self.pred_epoch_end(outputs, "test").items()}
+        self.log_dict(res)
+        return res
 
     def configure_optimizers(self):
         return AdamW(self.parameters(), lr=self.lr, correct_bias=True)
 
     def save_samples(self, samples, name):
         if self.args["save_samples"] > 0:
-            output_fields = ['only_domain', 'fewshot', 'grad_acc_steps', 'train_batch_size', 'state_converter']
+            output_fields = ['fewshot', 'grad_acc_steps', 'train_batch_size']
             output_name = '_'.join([str(self.args[k]) for k in output_fields]) + '_' + name + '_' + str(round(time.time()))
             filename = f'./samples_data/{output_name}.json'
             with open(filename, 'w') as f:
-                json.dump({k: v[:self.args['save_samples']] for k, v in samples.items()}, f)
+                for gold, pred in zip(samples['gold_summary'], samples['pred_summary']):
+                    f.write(json.dumps({"gold_summary": gold, "pred_summary": pred}, ensure_ascii=False)+'\n')
+                # json.dump({k: v[:self.args['save_samples']] for k, v in samples.items()}, f, ensure_ascii=False)

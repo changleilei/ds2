@@ -9,35 +9,42 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     T5Tokenizer
 )
-
+# os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 from ds2.datasets.data_loader import (
     prepare_data,
 )
 from ds2.configs.config import get_args
 from ds2.models.DS2 import DS2
+from ds2.models.DuleMon import DuLeMonModel
+from ds2.scripts.process_data_dulemon import prepare_dulemon_data, T5PegasusTokenizer
 
 
 def fine_tune(args, *more):
     args = vars(args)
     seed_everything(args["seed"])
     print(args)
+    if args["model_checkpoint"] == "../chinese_t5_pegasus_base":
+        tokenizer = T5PegasusTokenizer.from_pretrained(args["model_checkpoint"])
+        tokenizer.pad_token = '<pad>'
 
-    tokenizer = T5Tokenizer.from_pretrained(args["model_checkpoint"])
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args["model_checkpoint"])
     model = AutoModelForSeq2SeqLM.from_pretrained(args["model_checkpoint"])
-    dds = tokenizer("我真帅啊")
+    dds = tokenizer("User：我真帅啊\nBot：对啊，你真的飘亮".replace('\n', '[SEP]'))
     dd = tokenizer("我 真 帅 啊")
-    s = tokenizer.decode(dd['input_ids'])
+    s = tokenizer.decode(dds['input_ids'])
 
-    dataloaders, _ = prepare_data(
+
+    dataloaders = prepare_dulemon_data(
         args, tokenizer
     )
     print("Created dataloaders")
 
     # logging
     exp_name = args["exp_name"]
-    if not os.path.exists("ds2/logs"):
-        os.mkdir("ds2/logs")
-    log_path = f"ds2/logs/{exp_name}"
+    if not os.path.exists("/data/cll/ds2/ds2/logs"):
+        os.mkdir("/data/cll/ds2/ds2/logs")
+    log_path = f"/data/cll/ds2/ds2/logs{exp_name}"
     if not os.path.exists(log_path):
         os.mkdir(log_path)
 
@@ -51,7 +58,7 @@ def fine_tune(args, *more):
         assert len(pretrain_ckpts) == 1
         ckpt = pretrain_ckpts[0]
         print("load pretrained model from: ", os.path.join(pretrain_ckpt_path, ckpt))
-        dst_model = DS2.load_from_checkpoint(
+        dst_model = DuLeMonModel.load_from_checkpoint(
             os.path.join(pretrain_ckpt_path, ckpt),
             args=args,
             tokenizer=tokenizer,
@@ -59,24 +66,25 @@ def fine_tune(args, *more):
             qa_model=None,
         )
     else:
-        dst_model = DS2(args, tokenizer, model, None)
+        dst_model = DuLeMonModel(args, tokenizer, model, None)
 
     print("Created Model")
 
     dir_path = os.path.join(log_path, args["mode"])
     if not args["do_test_only"]:
         earlystopping_callback = EarlyStopping(
-            monitor="val_loss" if args["eval_loss_only"] else "val_jga",
+            monitor="val_loss",
             # min_delta=0.00,
             patience=args["patience"],
             verbose=False,
             mode="min" if args["eval_loss_only"] else "max",
         )
+        print(f"model saved in {dir_path}")
         checkpoint_callback = ModelCheckpoint(
             dirpath=dir_path,
-            filename="{val_loss:.3f}" if args["eval_loss_only"] else "{val_jga:.3f}",
+            filename="{val_loss:.3f}" if args["eval_loss_only"] else "{val_bleu:.3f}",
             save_top_k=1,
-            monitor="val_loss" if args["eval_loss_only"] else "val_jga",
+            monitor="val_loss" if args["eval_loss_only"] else "val_bleu",
             mode="min" if args["eval_loss_only"] else "max",
         )
         callbacks = [earlystopping_callback, checkpoint_callback]
@@ -103,7 +111,7 @@ def fine_tune(args, *more):
 
     if not args["do_train_only"]:
         print("test start...")
-        # evaluate model
+        # evaluate modelcd
         args["num_beams"] = args["test_num_beams"]
         if args["do_test_only"]:
             ckpts = [_ckpt for _ckpt in os.listdir(dir_path) if ".ckpt" in _ckpt]
@@ -114,7 +122,8 @@ def fine_tune(args, *more):
         else:
             ckpt_path = checkpoint_callback.best_model_path
 
-        dst_model = DS2.load_from_checkpoint(
+        print(f"Best checkpoints {ckpt_path}")
+        dst_model = DuLeMonModel.load_from_checkpoint(
             checkpoint_path=ckpt_path,
             args=args,
             tokenizer=tokenizer,
